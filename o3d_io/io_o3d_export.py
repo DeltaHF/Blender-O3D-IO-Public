@@ -117,12 +117,15 @@ def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_norma
 
     # Construct embedded material array
     o3d_mats = []
+    tex_found_count = 0
+    tex_missing_count = 0
     for mat in materials:
         # O3D mat structure:
         # (diffuse_r, diffuse_g, diffuse_b, diffuse_a, specular_r, specular_g, specular_b, emission_r, emission_g,
         #  emission_b, specular_power, texture_name)
         o3d_mat = []
         o3d_mats.append(o3d_mat)
+        mat_name = mat.name if hasattr(mat, 'name') else "?"
         if bpy.app.version < (2, 80):
             mat = mat.material
             o3d_mat.extend(mat.diffuse_color)
@@ -140,6 +143,12 @@ def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_norma
                 texture_data = texture_data.image.name
 
             o3d_mat.append(texture_data)
+            if texture_data:
+                tex_found_count += 1
+                log("  Material [{0}]: texture '{1}'".format(mat_name, texture_data))
+            else:
+                tex_missing_count += 1
+                log("  Material [{0}]: no texture found".format(mat_name))
         else:
             mat = node_shader_utils.PrincipledBSDFWrapper(mat.material, is_readonly=True)
             o3d_mat.extend(mat.base_color[:3])
@@ -148,9 +157,14 @@ def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_norma
             o3d_mat.extend(mat.emission_color[:3])
             o3d_mat.append(1 - mat.roughness)
             if mat.base_color_texture is not None and mat.base_color_texture.image is not None:
-                o3d_mat.append(os.path.basename(mat.base_color_texture.image.filepath))
+                tex_path = os.path.basename(mat.base_color_texture.image.filepath)
+                o3d_mat.append(tex_path)
+                tex_found_count += 1
+                log("  Material [{0}]: texture '{1}'".format(mat_name, tex_path))
             else:
                 o3d_mat.append("")
+                tex_missing_count += 1
+                log("  Material [{0}]: no texture found".format(mat_name))
 
     # Construct bones
     bones = []
@@ -162,6 +176,9 @@ def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_norma
                 bone[1].append((index, v_group.weight(index)))
             except Exception as e:
                 pass
+
+    log("  Extracted: {0} verts, {1} tris, {2} mats ({3} with tex, {4} without), {5} bones".format(
+        len(verts), len(tris), len(o3d_mats), tex_found_count, tex_missing_count, len(bones)))
 
     return verts, tris, o3d_mats, bones
 
@@ -179,6 +196,8 @@ def export_mesh(filepath, context, blender_obj, mesh, transform_matrix, material
                               long_triangle_indices=False,
                               alt_encryption_seed=True,
                               invert_triangle_winding=True)
+
+    log("  => Saved: {0} ({1} verts, {2} tris)".format(filepath, len(verts), len(tris)))
 
 
 def merge_mesh_data(mesh_data_list):
@@ -262,6 +281,12 @@ def do_export(filepath, context, global_matrix, use_selection, o3d_version, expo
     single_o3d = False
     if filepath[-3:] == "o3d":
         single_o3d = True
+
+    log("========================================")
+    log("Export started: {0}".format(filepath))
+    log("  Objects: {0}, Mode: {1}".format(len(obs), "MERGE" if merge_export and single_o3d else "INDIVIDUAL"))
+    log("  O3D Version: {0}, Custom Normals: {1}".format(o3d_version, export_custom_normals))
+    log("========================================")
 
     # Collect mesh data for merge export
     mesh_data_list = []
@@ -356,6 +381,9 @@ def do_export(filepath, context, global_matrix, use_selection, o3d_version, expo
         merged_verts, merged_tris, merged_mats, merged_bones = merge_mesh_data(mesh_data_list)
         long_indices = len(merged_verts) > 65535
 
+        tex_with = sum(1 for m in merged_mats if m[-1])
+        tex_without = sum(1 for m in merged_mats if not m[-1])
+
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         identity_transform = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
         with open(filepath, "wb") as f:
@@ -365,11 +393,21 @@ def do_export(filepath, context, global_matrix, use_selection, o3d_version, expo
                                   long_triangle_indices=long_indices,
                                   alt_encryption_seed=True,
                                   invert_triangle_winding=True)
-        log("Merged {0} objects into {1} (vertices: {2}, triangles: {3})".format(
-            len(mesh_data_list), filepath, len(merged_verts), len(merged_tris)))
+        log("----------------------------------------")
+        log("MERGE RESULT:")
+        log("  Merged {0} objects => {1}".format(len(mesh_data_list), filepath))
+        log("  Vertices: {0}, Triangles: {1}".format(len(merged_verts), len(merged_tris)))
+        log("  Materials: {0} ({1} with tex, {2} without)".format(
+            len(merged_mats), tex_with, tex_without))
+        if tex_with > 0:
+            for i, m in enumerate(merged_mats):
+                if m[-1]:
+                    log("    Mat[{0}]: '{1}'".format(i, m[-1]))
+        log("  Bones: {0}, Long indices: {1}".format(len(merged_bones), long_indices))
+        log("----------------------------------------")
 
     if not single_o3d:
         cfg_materials = o3d_cfg_parser.write_cfg(filepath, obs, context, use_selection)
 
     bpy.context.window_manager.progress_end()
-    log("Exported {0} models in {1} seconds!".format(len(obs), time.time() - start_time))
+    log("Export finished: {0} objects processed in {1:.2f}s".format(len(obs), time.time() - start_time))
