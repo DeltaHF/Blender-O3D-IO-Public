@@ -549,6 +549,32 @@ class PrincipledBSDFWrapper(ShaderWrapper):
     normalmap_texture = property(normalmap_texture_get)
 
 
+def _find_image_texture_node(node, depth=0, max_depth=10):
+    """
+    Recursively searches upstream from a shader node to find a ShaderNodeTexImage.
+    Traverses through intermediate nodes (MixRGB, RGBToBW, HueSaturation, etc.)
+    that are commonly generated when converting v2.78 materials to v3.6+.
+    :param node: the shader node to start searching from
+    :param depth: current recursion depth
+    :param max_depth: maximum recursion depth to prevent infinite loops
+    :return: ShaderNodeTexImage if found, None otherwise
+    """
+    if depth > max_depth or node is None:
+        return None
+
+    if node.bl_idname == 'ShaderNodeTexImage':
+        return node
+
+    # Traverse all inputs of this node to find an upstream image texture
+    for input_socket in node.inputs:
+        if input_socket.is_linked:
+            result = _find_image_texture_node(input_socket.links[0].from_node, depth + 1, max_depth)
+            if result is not None:
+                return result
+
+    return None
+
+
 class ShaderImageTextureWrapper():
     """
     Generic 'image texture'-like wrapper, handling image node, some mapping (texture coordinates transformations),
@@ -608,6 +634,9 @@ class ShaderImageTextureWrapper():
             from_node = socket_dst.links[0].from_node
             if from_node.bl_idname == 'ShaderNodeTexImage':
                 self._node_image = from_node
+            else:
+                # Traverse intermediate nodes to find an upstream Image Texture node
+                self._node_image = _find_image_texture_node(from_node)
 
         if self.node_image is not None:
             socket_dst = self.node_image.inputs["Vector"]
