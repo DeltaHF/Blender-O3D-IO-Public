@@ -20,7 +20,67 @@ def log(*args):
     print("[O3D_Export]", *args)
 
 
-def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_normals):
+def _resolve_texture_path(image, export_dir):
+    """
+    Resolve a Blender image's filepath to the texture filename.
+    Uses basename only (O3D format only supports plain filenames).
+    Falls back to image.name if filepath is empty (e.g. packed/generated images).
+    :param image: Blender image datablock
+    :param export_dir: unused, kept for API compatibility
+    :return: texture filename string, or empty string
+    """
+    if image is None:
+        return ""
+
+    if image.filepath:
+        # Resolve Blender's '//' prefix then take basename only
+        abs_path = bpy.path.abspath(image.filepath)
+        if abs_path:
+            return os.path.basename(abs_path)
+        return os.path.basename(image.filepath)
+
+    # Packed or generated image: use datablock name as filename
+    img_name = image.name
+    for ext in ('.dds', '.png', '.tga', '.bmp', '.jpg', '.jpeg', '.tiff'):
+        if ext in img_name:
+            img_name = img_name[:img_name.index(ext) + len(ext)]
+            break
+    return img_name
+
+
+def _find_texture_via_wrapper(material):
+    """
+    Try to find texture via PrincipledBSDFWrapper (standard Principled BSDF setup).
+    Returns the Blender image datablock or None.
+    """
+    try:
+        bsdf = node_shader_utils.PrincipledBSDFWrapper(material, is_readonly=True)
+        if bsdf.base_color_texture is not None and bsdf.base_color_texture.image is not None:
+            return bsdf.base_color_texture.image
+    except Exception:
+        pass
+    return None
+
+
+def _find_texture_in_node_tree(material):
+    """
+    Fallback: search all nodes in the material's node tree for the first Image Texture node
+    with a valid image datablock. Covers cases where PrincipledBSDFWrapper fails
+    (e.g. v2.78 converted materials with Diffuse BSDF, unconnected texture nodes, etc.)
+    Also finds images with empty filepath (packed or missing images).
+    Returns the Blender image datablock or None.
+    """
+    if not hasattr(material, 'node_tree') or material.node_tree is None:
+        return None
+
+    for node in material.node_tree.nodes:
+        if node.bl_idname == 'ShaderNodeTexImage':
+            if node.image is not None:
+                return node.image
+    return None
+
+
+def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_normals, export_dir=""):
     """
     Extracts mesh data from a Blender object into O3D-compatible arrays.
     :param context: blender context
@@ -119,15 +179,15 @@ def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_norma
     o3d_mats = []
     tex_found_count = 0
     tex_missing_count = 0
-    for mat in materials:
+    for mat_slot in materials:
         # O3D mat structure:
         # (diffuse_r, diffuse_g, diffuse_b, diffuse_a, specular_r, specular_g, specular_b, emission_r, emission_g,
         #  emission_b, specular_power, texture_name)
         o3d_mat = []
         o3d_mats.append(o3d_mat)
-        mat_name = mat.name if hasattr(mat, 'name') else "?"
+        mat_name = mat_slot.name if hasattr(mat_slot, 'name') else "?"
         if bpy.app.version < (2, 80):
-            mat = mat.material
+            mat = mat_slot.material
             o3d_mat.extend(mat.diffuse_color)
             o3d_mat.append(mat.alpha)
             o3d_mat.extend(np.array(mat.specular_color) * mat.specular_intensity)
@@ -150,19 +210,29 @@ def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_norma
                 tex_missing_count += 1
                 log("  Material [{0}]: no texture found".format(mat_name))
         else:
-            mat = node_shader_utils.PrincipledBSDFWrapper(mat.material, is_readonly=True)
-            o3d_mat.extend(mat.base_color[:3])
-            o3d_mat.append(mat.alpha)
-            o3d_mat.extend([mat.specular, mat.specular, mat.specular])
-            o3d_mat.extend(mat.emission_color[:3])
-            o3d_mat.append(1 - mat.roughness)
-            if mat.base_color_texture is not None and mat.base_color_texture.image is not None:
-                tex_path = os.path.basename(mat.base_color_texture.image.filepath)
-                o3d_mat.append(tex_path)
+            # Method 1: Try PrincipledBSDFWrapper (works for standard Principled BSDF materials)
+            tex_image = _find_texture_via_wrapper(mat_slot.material)
+
+            # Method 2: Fallback - search all nodes in the material tree directly
+            if tex_image is None:
+                tex_image = _find_texture_in_node_tree(mat_slot.material)
+
+            # Resolve texture path relative to export directory
+            tex_path = _resolve_texture_path(tex_image, export_dir) if tex_image else ""
+
+            # Read material color values
+            bsdf = node_shader_utils.PrincipledBSDFWrapper(mat_slot.material, is_readonly=True)
+            o3d_mat.extend(bsdf.base_color[:3])
+            o3d_mat.append(bsdf.alpha)
+            o3d_mat.extend([bsdf.specular, bsdf.specular, bsdf.specular])
+            o3d_mat.extend(bsdf.emission_color[:3])
+            o3d_mat.append(1 - bsdf.roughness)
+            o3d_mat.append(tex_path)
+
+            if tex_path:
                 tex_found_count += 1
                 log("  Material [{0}]: texture '{1}'".format(mat_name, tex_path))
             else:
-                o3d_mat.append("")
                 tex_missing_count += 1
                 log("  Material [{0}]: no texture found".format(mat_name))
 
@@ -188,7 +258,8 @@ def export_mesh(filepath, context, blender_obj, mesh, transform_matrix, material
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "wb") as f:
         verts, tris, o3d_mats, bones = extract_mesh_data(
-            context, blender_obj, mesh, materials, export_custom_normals)
+            context, blender_obj, mesh, materials, export_custom_normals,
+            export_dir=os.path.dirname(filepath))
 
         o3dconvert.export_o3d(f, verts, tris, o3d_mats, bones, transform_matrix,
                               version=o3d_version,
@@ -353,7 +424,8 @@ def do_export(filepath, context, global_matrix, use_selection, o3d_version, expo
 
         if merge_export and single_o3d:
             # Merge mode: extract data and collect for later merging
-            data = extract_mesh_data(context, ob_eval, me, ob_eval.material_slots, export_custom_normals)
+            data = extract_mesh_data(context, ob_eval, me, ob_eval.material_slots,
+                                     export_custom_normals, export_dir=obj_root)
             mesh_data_list.append(data)
         else:
             # Export individual model
