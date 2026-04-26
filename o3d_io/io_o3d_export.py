@@ -20,142 +20,246 @@ def log(*args):
     print("[O3D_Export]", *args)
 
 
+def _resolve_texture_path(image, export_dir):
+    """
+    Resolve a Blender image's filepath to the texture filename.
+    Uses basename only (O3D format only supports plain filenames).
+    Falls back to image.name if filepath is empty (e.g. packed/generated images).
+    :param image: Blender image datablock
+    :param export_dir: unused, kept for API compatibility
+    :return: texture filename string, or empty string
+    """
+    if image is None:
+        return ""
+
+    if image.filepath:
+        # Resolve Blender's '//' prefix then take basename only
+        abs_path = bpy.path.abspath(image.filepath)
+        if abs_path:
+            return os.path.basename(abs_path)
+        return os.path.basename(image.filepath)
+
+    # Packed or generated image: use datablock name as filename
+    img_name = image.name
+    for ext in ('.dds', '.png', '.tga', '.bmp', '.jpg', '.jpeg', '.tiff'):
+        if ext in img_name:
+            img_name = img_name[:img_name.index(ext) + len(ext)]
+            break
+    return img_name
+
+
+def _find_texture_via_wrapper(material):
+    """
+    Try to find texture via PrincipledBSDFWrapper (standard Principled BSDF setup).
+    Returns the Blender image datablock or None.
+    """
+    try:
+        bsdf = node_shader_utils.PrincipledBSDFWrapper(material, is_readonly=True)
+        if bsdf.base_color_texture is not None and bsdf.base_color_texture.image is not None:
+            return bsdf.base_color_texture.image
+    except Exception:
+        pass
+    return None
+
+
+def _find_texture_in_node_tree(material):
+    """
+    Fallback: search all nodes in the material's node tree for the first Image Texture node
+    with a valid image datablock. Covers cases where PrincipledBSDFWrapper fails
+    (e.g. v2.78 converted materials with Diffuse BSDF, unconnected texture nodes, etc.)
+    Also finds images with empty filepath (packed or missing images).
+    Returns the Blender image datablock or None.
+    """
+    if not hasattr(material, 'node_tree') or material.node_tree is None:
+        return None
+
+    for node in material.node_tree.nodes:
+        if node.bl_idname == 'ShaderNodeTexImage':
+            if node.image is not None:
+                return node.image
+    return None
+
+
+def extract_mesh_data(context, blender_obj, mesh, materials, export_custom_normals, export_dir=""):
+    """
+    Extracts mesh data from a Blender object into O3D-compatible arrays.
+    :param context: blender context
+    :param blender_obj: the blender object
+    :param mesh: the mesh data to extract
+    :param materials: the material slots of the object
+    :param export_custom_normals: whether to export custom split normals
+    :return: (verts, tris, o3d_mats, bones)
+    """
+    has_uvs = len(mesh.uv_layers) > 0
+    if has_uvs:
+        uv_layer = mesh.uv_layers.active.data[:]
+    else:
+        uv_layer = None
+
+    # Extract mesh data
+    tris = []
+    verts = []  # Array of (xp, yp, zp, xn, yn, zn, u, v)
+    vert_map = {}
+    vert_count = 0
+
+    if bpy.app.version < (2, 80):
+        mesh.calc_normals_split()
+        mesh.calc_tessface()
+        uv_layer = mesh.tessface_uv_textures.active
+        for face in mesh.tessfaces:
+            face_inds = []
+
+            face_len = len(face.vertices)
+            for i in range(face_len):
+                v_co = mesh.vertices[face.vertices[i]].co[:]
+                v_nrm = face.split_normals[i][:]
+                if uv_layer is not None:
+                    v_uv = uv_layer.data[face.index].uv[i][:]
+                else:
+                    v_uv = (0, 0)
+
+                if (v_co, v_nrm, v_uv) in vert_map:
+                    face_inds.append(vert_map[(v_co, v_nrm, v_uv)])
+                else:
+                    vert_map[(v_co, v_nrm, v_uv)] = vert_count
+                    verts.append(
+                        [v_co[0], v_co[1], v_co[2],
+                         v_nrm[0], v_nrm[1], v_nrm[2],
+                         v_uv[0], 1 - v_uv[1]])
+
+                    face_inds.append(vert_count)
+
+                    vert_count += 1
+
+            # Create the triangle
+            if face_len >= 3:
+                tris.append((face_inds[0], face_inds[1], face_inds[2], face.material_index))
+
+            # Sometimes we have to deal with quads...
+            # 2---3
+            # | \ |
+            # 0---1
+            if face_len >= 4:
+                tris.append((face_inds[1], face_inds[3], face_inds[2], face.material_index))
+    else:
+        mesh.calc_loop_triangles()
+        if export_custom_normals and mesh.has_custom_normals:
+            # mesh.polygons.foreach_set("use_smooth", [False] * len(mesh.polygons))
+            mesh.use_auto_smooth = True
+        else:
+            mesh.free_normals_split()
+        mesh.calc_normals_split()
+        for tri_loop in mesh.loop_triangles:
+            tri = []
+            tris.append(tri)
+
+            for tri_vert, loop, normal in zip(tri_loop.vertices, tri_loop.loops, tri_loop.split_normals):
+                vert = mesh.vertices[tri_vert]
+                v_co = vert.co[:]
+                v_nrm = mesh.loops[loop].normal[:]
+                if uv_layer is not None:
+                    v_uv = uv_layer[loop].uv[:2]
+                else:
+                    v_uv = (0, 0)
+
+                if (v_co, v_nrm, v_uv) in vert_map:
+                    tri.append(vert_map[(v_co, v_nrm, v_uv)])
+                else:
+                    vert_map[(v_co, v_nrm, v_uv)] = vert_count
+                    verts.append(
+                        [v_co[0], v_co[1], v_co[2],
+                         -v_nrm[0], -v_nrm[1], -v_nrm[2],
+                         v_uv[0], 1 - v_uv[1]])
+                    tri.append(vert_count)
+                    vert_count += 1
+
+            tri.append(tri_loop.material_index)
+
+    # Construct embedded material array
+    o3d_mats = []
+    tex_found_count = 0
+    tex_missing_count = 0
+    for mat_slot in materials:
+        # O3D mat structure:
+        # (diffuse_r, diffuse_g, diffuse_b, diffuse_a, specular_r, specular_g, specular_b, emission_r, emission_g,
+        #  emission_b, specular_power, texture_name)
+        o3d_mat = []
+        o3d_mats.append(o3d_mat)
+        mat_name = mat_slot.name if hasattr(mat_slot, 'name') else "?"
+        if bpy.app.version < (2, 80):
+            mat = mat_slot.material
+            o3d_mat.extend(mat.diffuse_color)
+            o3d_mat.append(mat.alpha)
+            o3d_mat.extend(np.array(mat.specular_color) * mat.specular_intensity)
+            o3d_mat.extend(np.array(mat.diffuse_color) * mat.emit)
+            o3d_mat.append(mat.specular_hardness)
+            texture_data = ""
+            for i, texture in reversed(list(enumerate(mat.texture_slots))):
+                if texture is None or texture.texture_coords != 'UV' or not texture.use_map_color_diffuse:
+                    continue
+                texture_data = bpy.data.textures[texture.name]
+                if texture_data.type != 'IMAGE' or texture_data.image is None or not mat.use_textures[i]:
+                    continue
+                texture_data = texture_data.image.name
+
+            o3d_mat.append(texture_data)
+            if texture_data:
+                tex_found_count += 1
+                log("  Material [{0}]: texture '{1}'".format(mat_name, texture_data))
+            else:
+                tex_missing_count += 1
+                log("  Material [{0}]: no texture found".format(mat_name))
+        else:
+            # Method 1: Try PrincipledBSDFWrapper (works for standard Principled BSDF materials)
+            tex_image = _find_texture_via_wrapper(mat_slot.material)
+
+            # Method 2: Fallback - search all nodes in the material tree directly
+            if tex_image is None:
+                tex_image = _find_texture_in_node_tree(mat_slot.material)
+
+            # Resolve texture path relative to export directory
+            tex_path = _resolve_texture_path(tex_image, export_dir) if tex_image else ""
+
+            # Read material color values
+            bsdf = node_shader_utils.PrincipledBSDFWrapper(mat_slot.material, is_readonly=True)
+            o3d_mat.extend(bsdf.base_color[:3])
+            o3d_mat.append(bsdf.alpha)
+            o3d_mat.extend([bsdf.specular, bsdf.specular, bsdf.specular])
+            o3d_mat.extend(bsdf.emission_color[:3])
+            o3d_mat.append(1 - bsdf.roughness)
+            o3d_mat.append(tex_path)
+
+            if tex_path:
+                tex_found_count += 1
+                log("  Material [{0}]: texture '{1}'".format(mat_name, tex_path))
+            else:
+                tex_missing_count += 1
+                log("  Material [{0}]: no texture found".format(mat_name))
+
+    # Construct bones
+    bones = []
+    for v_group in blender_obj.vertex_groups:
+        bone = (v_group.name, [])
+        bones.append(bone)
+        for index in range(len(verts)):
+            try:
+                bone[1].append((index, v_group.weight(index)))
+            except Exception as e:
+                pass
+
+    log("  Extracted: {0} verts, {1} tris, {2} mats ({3} with tex, {4} without), {5} bones".format(
+        len(verts), len(tris), len(o3d_mats), tex_found_count, tex_missing_count, len(bones)))
+
+    return verts, tris, o3d_mats, bones
+
+
 def export_mesh(filepath, context, blender_obj, mesh, transform_matrix, materials, o3d_version, export_custom_normals):
     # Create o3d file
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "wb") as f:
-        has_uvs = len(mesh.uv_layers) > 0
-        if has_uvs:
-            uv_layer = mesh.uv_layers.active.data[:]
-        else:
-            uv_layer = None
-
-        # Extract mesh data
-        tris = []
-        verts = []  # Array of (xp, yp, zp, xn, yn, zn, u, v)
-        vert_map = {}
-        vert_count = 0
-
-        if bpy.app.version < (2, 80):
-            mesh.calc_normals_split()
-            mesh.calc_tessface()
-            uv_layer = mesh.tessface_uv_textures.active
-            for face in mesh.tessfaces:
-                face_inds = []
-
-                face_len = len(face.vertices)
-                for i in range(face_len):
-                    v_co = mesh.vertices[face.vertices[i]].co[:]
-                    v_nrm = face.split_normals[i][:]
-                    if uv_layer is not None:
-                        v_uv = uv_layer.data[face.index].uv[i][:]
-                    else:
-                        v_uv = (0, 0)
-
-                    if (v_co, v_nrm, v_uv) in vert_map:
-                        face_inds.append(vert_map[(v_co, v_nrm, v_uv)])
-                    else:
-                        vert_map[(v_co, v_nrm, v_uv)] = vert_count
-                        verts.append(
-                            [v_co[0], v_co[1], v_co[2],
-                             v_nrm[0], v_nrm[1], v_nrm[2],
-                             v_uv[0], 1 - v_uv[1]])
-
-                        face_inds.append(vert_count)
-
-                        vert_count += 1
-
-                # Create the triangle
-                if face_len >= 3:
-                    tris.append((face_inds[0], face_inds[1], face_inds[2], face.material_index))
-
-                # Sometimes we have to deal with quads...
-                # 2---3
-                # | \ |
-                # 0---1
-                if face_len >= 4:
-                    tris.append((face_inds[1], face_inds[3], face_inds[2], face.material_index))
-        else:
-            mesh.calc_loop_triangles()
-            if export_custom_normals and mesh.has_custom_normals:
-                # mesh.polygons.foreach_set("use_smooth", [False] * len(mesh.polygons))
-                mesh.use_auto_smooth = True
-            else:
-                mesh.free_normals_split()
-            mesh.calc_normals_split()
-            for tri_loop in mesh.loop_triangles:
-                tri = []
-                tris.append(tri)
-
-                for tri_vert, loop, normal in zip(tri_loop.vertices, tri_loop.loops, tri_loop.split_normals):
-                    vert = mesh.vertices[tri_vert]
-                    v_co = vert.co[:]
-                    v_nrm = mesh.loops[loop].normal[:]
-                    if uv_layer is not None:
-                        v_uv = uv_layer[loop].uv[:2]
-                    else:
-                        v_uv = (0, 0)
-
-                    if (v_co, v_nrm, v_uv) in vert_map:
-                        tri.append(vert_map[(v_co, v_nrm, v_uv)])
-                    else:
-                        vert_map[(v_co, v_nrm, v_uv)] = vert_count
-                        verts.append(
-                            [v_co[0], v_co[1], v_co[2],
-                             -v_nrm[0], -v_nrm[1], -v_nrm[2],
-                             v_uv[0], 1 - v_uv[1]])
-                        tri.append(vert_count)
-                        vert_count += 1
-
-                tri.append(tri_loop.material_index)
-
-        # Construct embedded material array
-        o3d_mats = []
-        for mat in materials:
-            # O3D mat structure:
-            # (diffuse_r, diffuse_g, diffuse_b, diffuse_a, specular_r, specular_g, specular_b, emission_r, emission_g,
-            #  emission_b, specular_power, texture_name)
-            o3d_mat = []
-            o3d_mats.append(o3d_mat)
-            if bpy.app.version < (2, 80):
-                mat = mat.material
-                o3d_mat.extend(mat.diffuse_color)
-                o3d_mat.append(mat.alpha)
-                o3d_mat.extend(np.array(mat.specular_color) * mat.specular_intensity)
-                o3d_mat.extend(np.array(mat.diffuse_color) * mat.emit)
-                o3d_mat.append(mat.specular_hardness)
-                texture_data = ""
-                for i, texture in reversed(list(enumerate(mat.texture_slots))):
-                    if texture is None or texture.texture_coords != 'UV' or not texture.use_map_color_diffuse:
-                        continue
-                    texture_data = bpy.data.textures[texture.name]
-                    if texture_data.type != 'IMAGE' or texture_data.image is None or not mat.use_textures[i]:
-                        continue
-                    texture_data = texture_data.image.name
-
-                o3d_mat.append(texture_data)
-            else:
-                mat = node_shader_utils.PrincipledBSDFWrapper(mat.material, is_readonly=True)
-                o3d_mat.extend(mat.base_color[:3])
-                o3d_mat.append(mat.alpha)
-                o3d_mat.extend([mat.specular, mat.specular, mat.specular])
-                o3d_mat.extend(mat.emission_color[:3])
-                o3d_mat.append(1 - mat.roughness)
-                if mat.base_color_texture is not None and mat.base_color_texture.image is not None:
-                    o3d_mat.append(os.path.basename(mat.base_color_texture.image.filepath))
-                else:
-                    o3d_mat.append("")
-
-        # Construct bones
-        bones = []
-        for v_group in blender_obj.vertex_groups:
-            bone = (v_group.name, [])
-            bones.append(bone)
-            for index in range(len(verts)):
-                try:
-                    bone[1].append((index, v_group.weight(index)))
-                except Exception as e:
-                    pass
+        verts, tris, o3d_mats, bones = extract_mesh_data(
+            context, blender_obj, mesh, materials, export_custom_normals,
+            export_dir=os.path.dirname(filepath))
 
         o3dconvert.export_o3d(f, verts, tris, o3d_mats, bones, transform_matrix,
                               version=o3d_version,
@@ -164,8 +268,59 @@ def export_mesh(filepath, context, blender_obj, mesh, transform_matrix, material
                               alt_encryption_seed=True,
                               invert_triangle_winding=True)
 
+    log("  => Saved: {0} ({1} verts, {2} tris)".format(filepath, len(verts), len(tris)))
 
-def do_export(filepath, context, global_matrix, use_selection, o3d_version, export_custom_normals=True):
+
+def merge_mesh_data(mesh_data_list):
+    """
+    Merges multiple sets of extracted mesh data into a single set.
+    Handles vertex index offsetting, material index offsetting, and bone merging.
+
+    :param mesh_data_list: list of (verts, tris, o3d_mats, bones) tuples
+    :return: (merged_verts, merged_tris, merged_mats, merged_bones)
+    """
+    merged_verts = []
+    merged_tris = []
+    merged_mats = []
+    merged_bones_dict = {}  # bone_name -> [(vertex_index, weight), ...]
+
+    vertex_offset = 0
+    material_offset = 0
+
+    for verts, tris, mats, bones in mesh_data_list:
+        # Append vertices directly
+        merged_verts.extend(verts)
+
+        # Offset triangle vertex indices and material indices
+        for tri in tris:
+            merged_tris.append((
+                tri[0] + vertex_offset,
+                tri[1] + vertex_offset,
+                tri[2] + vertex_offset,
+                tri[3] + material_offset
+            ))
+
+        # Append materials
+        merged_mats.extend(mats)
+
+        # Merge bones: combine weight lists for same-named bones
+        for bone_name, weights in bones:
+            adjusted_weights = [(idx + vertex_offset, w) for idx, w in weights]
+            if bone_name in merged_bones_dict:
+                merged_bones_dict[bone_name].extend(adjusted_weights)
+            else:
+                merged_bones_dict[bone_name] = adjusted_weights
+
+        vertex_offset += len(verts)
+        material_offset += len(mats)
+
+    # Convert bones dict back to list of tuples
+    merged_bones = [(name, weights) for name, weights in merged_bones_dict.items()]
+
+    return merged_verts, merged_tris, merged_mats, merged_bones
+
+
+def do_export(filepath, context, global_matrix, use_selection, o3d_version, export_custom_normals=True, merge_export=False):
     """
     Exports the selected CFG/SCO/O3D file
     :param o3d_version: O3D version to export the file as
@@ -173,6 +328,7 @@ def do_export(filepath, context, global_matrix, use_selection, o3d_version, expo
     :param global_matrix: transformation matrix to apply before export
     :param filepath: the path to the file to import
     :param context: blender context
+    :param merge_export: merge all objects into a single .o3d file
     :return: success message
     """
     obj_root = os.path.dirname(filepath)
@@ -196,6 +352,15 @@ def do_export(filepath, context, global_matrix, use_selection, o3d_version, expo
     single_o3d = False
     if filepath[-3:] == "o3d":
         single_o3d = True
+
+    log("========================================")
+    log("Export started: {0}".format(filepath))
+    log("  Objects: {0}, Mode: {1}".format(len(obs), "MERGE" if merge_export and single_o3d else "INDIVIDUAL"))
+    log("  O3D Version: {0}, Custom Normals: {1}".format(o3d_version, export_custom_normals))
+    log("========================================")
+
+    # Collect mesh data for merge export
+    mesh_data_list = []
 
     index = 0
     exported_paths = set()
@@ -257,28 +422,64 @@ def do_export(filepath, context, global_matrix, use_selection, o3d_version, expo
 
         me.calc_normals_split()
 
-        # Export individual model
-        if "export_path" in ob:
-            path = os.path.join(obj_root, ob["export_path"])
+        if merge_export and single_o3d:
+            # Merge mode: extract data and collect for later merging
+            data = extract_mesh_data(context, ob_eval, me, ob_eval.material_slots,
+                                     export_custom_normals, export_dir=obj_root)
+            mesh_data_list.append(data)
         else:
-            path = os.path.join(obj_root, ob.name + ".o3d")
-
-        if single_o3d:
-            if len(obs) == 1:
-                path = filepath
+            # Export individual model
+            if "export_path" in ob:
+                path = os.path.join(obj_root, ob["export_path"])
             else:
-                path = os.path.join(obj_root, os.path.basename(filepath)[:-4] + "-" + ob.name + ".o3d")
+                path = os.path.join(obj_root, ob.name + ".o3d")
 
-        # Export the mesh if it hasn't already been exported
-        if path not in exported_paths:
-            exported_paths.add(path)
-            export_mesh(path, context, ob_eval, me, [x for y in o3d_matrix for x in y], ob_eval.material_slots,
-                        o3d_version, export_custom_normals)
+            if single_o3d:
+                if len(obs) == 1:
+                    path = filepath
+                else:
+                    path = os.path.join(obj_root, os.path.basename(filepath)[:-4] + "-" + ob.name + ".o3d")
+
+            # Export the mesh if it hasn't already been exported
+            if path not in exported_paths:
+                exported_paths.add(path)
+                export_mesh(path, context, ob_eval, me, [x for y in o3d_matrix for x in y], ob_eval.material_slots,
+                            o3d_version, export_custom_normals)
 
         index += 1
+
+    # Write merged .o3d file
+    if merge_export and single_o3d and len(mesh_data_list) > 0:
+        merged_verts, merged_tris, merged_mats, merged_bones = merge_mesh_data(mesh_data_list)
+        long_indices = len(merged_verts) > 65535
+
+        tex_with = sum(1 for m in merged_mats if m[-1])
+        tex_without = sum(1 for m in merged_mats if not m[-1])
+
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        identity_transform = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+        with open(filepath, "wb") as f:
+            o3dconvert.export_o3d(f, merged_verts, merged_tris, merged_mats, merged_bones, identity_transform,
+                                  version=o3d_version,
+                                  encrypted=False, encryption_key=0x0,
+                                  long_triangle_indices=long_indices,
+                                  alt_encryption_seed=True,
+                                  invert_triangle_winding=True)
+        log("----------------------------------------")
+        log("MERGE RESULT:")
+        log("  Merged {0} objects => {1}".format(len(mesh_data_list), filepath))
+        log("  Vertices: {0}, Triangles: {1}".format(len(merged_verts), len(merged_tris)))
+        log("  Materials: {0} ({1} with tex, {2} without)".format(
+            len(merged_mats), tex_with, tex_without))
+        if tex_with > 0:
+            for i, m in enumerate(merged_mats):
+                if m[-1]:
+                    log("    Mat[{0}]: '{1}'".format(i, m[-1]))
+        log("  Bones: {0}, Long indices: {1}".format(len(merged_bones), long_indices))
+        log("----------------------------------------")
 
     if not single_o3d:
         cfg_materials = o3d_cfg_parser.write_cfg(filepath, obs, context, use_selection)
 
     bpy.context.window_manager.progress_end()
-    log("Exported {0} models in {1} seconds!".format(len(obs), time.time() - start_time))
+    log("Export finished: {0} objects processed in {1:.2f}s".format(len(obs), time.time() - start_time))

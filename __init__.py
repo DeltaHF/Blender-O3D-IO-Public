@@ -23,11 +23,11 @@
 
 bl_info = {
     "name": "Import OMSI map/cfg/sco/o3d files",
-    "author": "Adam/Thomas Mathieson",
-    "version": (1, 2, 2),
+    "author": "Adam/Thomas Mathieson, BSTech",
+    "version": (1, 3, 4),
     "blender": (3, 1, 0),
     "location": "File > Import-Export",
-    "description": "Import OMSI model .map, .cfg, .sco, and .o3d files along with their meshes, UVs, and materials",
+    "description": "Import OMSI model .map, .cfg, .sco, and .o3d files along with their meshes, UVs, and materials | v1.3.0: Merge export; v1.3.1: Recursive texture search; v1.3.2: Relative texture path support",
     "wiki_url": "https://github.com/space928/Blender-O3D-IO-Public",
     "doc_url": "https://github.com/space928/Blender-O3D-IO-Public",
     "tracker_url": "https://github.com/space928/Blender-O3D-IO-Public/issues/new?assignees=&labels=bug%2C+needs"
@@ -205,13 +205,18 @@ class ExportModelCFG(bpy.types.Operator, ExportHelper):
         max=7,
         default=7,
     )
+    merge_export = BoolProperty(
+        name="合并导出 (Merge Export)",
+        description="将所有选中对象合并导出为一个 .o3d 文件",
+        default=False,
+    )
 
     def execute(self, context):
         context.window.cursor_set('WAIT')
 
         global_matrix = Matrix.Scale(self.global_scale, 4)
         io_o3d_export.do_export(self.filepath, context, global_matrix, self.use_selection, self.o3d_version,
-                                self.export_custom_normals)
+                                self.export_custom_normals, self.merge_export)
 
         context.window.cursor_set('DEFAULT')
 
